@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# pdf.js 资源（cmap / 字体）为二进制，禁止换行转换
+*.bcmap binary
+*.pfb binary
+*.afm binary

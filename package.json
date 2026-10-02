@@ -1,0 +1,17 @@
+{
+  "name": "stamp-tool",
+  "version": "1.0.0",
+  "private": true,
+  "description": "文件盖章 · 本地版 —— 单页盖章 + 骑缝章，绿色单文件 exe（Node SEA）",
+  "scripts": {
+    "start": "node src/server.js",
+    "build": "node build/build_sea.mjs"
+  },
+  "dependencies": {
+    "pdf-lib": "1.17.1",
+    "pdfjs-dist": "3.11.174"
+  },
+  "devDependencies": {
+    "postject": "1.0.0-alpha.6"
+  }
+}

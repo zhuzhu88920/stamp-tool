@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>文件盖章 · 本地版</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head><body>
+<header>
+  <div class="hd-top"><div><h1>🖋 文件盖章</h1><div class="sub">本地版 · PDF 直接盖章 / 图片自动转 PDF · 支持骑缝章 · 数据不出本机</div></div></div>
+</header>
+<main>
+  <section data-real>
+    <div class="upcard" id="dropzone">
+      <div class="big">🖋</div>
+      <p><b>拖拽文件到此处，或</b></p>
+      <div style="display:flex;gap:8px;justify-content:center">
+        <button class="btn pri" id="btnPick" type="button">选择文件</button>
+      </div>
+      <input type="file" id="fileInput" accept=".pdf,.jpg,.jpeg,.png" style="display:none">
+      <p class="uphint">PDF 直接盖章；jpg / png 自动转为 PDF 页；首次使用请先在右侧设置印章目录</p>
+    </div>
+
+    <div id="workspace" style="display:none">
+      <div class="topbar">
+        <span class="fn" id="fileName"></span>
+        <span style="flex:1"></span>
+        <button class="btn pri" id="btnDownload" type="button">下载盖章版</button>
+        <button class="btn" id="btnReset" type="button">换文件</button>
+      </div>
+      <div class="stage">
+        <div class="preview">
+          <div class="pagebar">
+            <button class="btn sm" id="btnPrev" type="button">上一页</button>
+            <span id="pageInfo">1 / 1</span>
+            <button class="btn sm" id="btnNext" type="button">下一页</button>
+            <input type="range" id="zoom" min="50" max="200" step="10" value="100">
+            <span id="zoomVal">100%</span>
+            <span class="selinfo" id="hint"></span>
+          </div>
+          <div class="canvas-wrap" id="canvasWrap">
+            <canvas id="pdfCanvas"></canvas>
+            <div id="overlay"></div>
+            <div class="floating" id="floatSeal" style="display:none"><img id="floatImg" alt=""></div>
+          </div>
+        </div>
+        <aside class="seal-panel">
+          <div class="dir-row" id="dirRow" title="">
+            <span class="dir-ico">📁</span>
+            <span class="dir-val" id="dirVal">印章目录加载中…</span>
+            <button class="btn sm" id="btnDir" type="button">更改</button>
+          </div>
+          <div class="mode">
+            <button class="btn sm pri" id="modeNormal" type="button">普通章</button>
+            <button class="btn sm" id="modeQiefeng" type="button">骑缝章</button>
+          </div>
+          <div class="mode-tip" id="modeTip"></div>
+          <div class="seals" id="sealList"><div style="grid-column:1/-1;color:#9aa7b5;font-size:12px">印章加载中…</div></div>
+          <button class="btn sm wfull" id="btnSealUpload" type="button">+ 上传印章（PNG 透明底）</button>
+          <input type="file" id="sealInput" accept=".png" style="display:none">
+          <div class="pos-list" id="posList"></div>
+        </aside>
+      </div>
+    </div>
+  </section>
+</main>
+
+<dialog id="dlgDir">
+  <div class="dlg">
+    <h3>印章目录</h3>
+    <p>指定存放印章 PNG 的文件夹，设置后自动记住，下次免设。留空则使用本程序旁边的 <b>stamps</b> 文件夹。</p>
+    <input id="dirInput" placeholder="例如 D:\我的印章">
+    <div class="acts"><button class="btn" id="btnDirClose" type="button">取消</button><button class="btn pri" id="btnDirSave" type="button">保存</button></div>
+  </div>
+</dialog>
+
+<div class="toast" id="toast"></div>
+<script src="/vendor/pdf.min.js"></script>
+<script src="/vendor/pdf-lib.min.js"></script>
+<script src="/assets/app.js"></script>
+<script src="/assets/stamp.js"></script>
+</body></html>
