@@ -11,8 +11,9 @@
  */
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, execFile, execFileSync, spawn } = require('child_process');
 
 let sea = null;
 let IS_SEA = false;
@@ -113,6 +114,251 @@ function safeName(name) {
   return base;
 }
 
+// ---------- Office 能力检测 + 常驻转换宿主（COM 实探权威 + 实例复用） ----------
+// 设计目标：避免每次转换都冷启动 Excel/Word（含 Quit 约 4s 开销），对标线上常驻实例。
+// 方案：启动时拉起一个常驻 PowerShell 进程，初始化并保活 Word/Excel COM 实例；
+//       /api/convert 通过 stdin 向该进程派发任务、stdout 回收结果。
+//       COM 单线程 → 任务串行；宿主崩溃自动重启一次，失败则回退到「每次新开进程」的旧方案。
+//       卸载残留骗不过 COM 实探，能力判定权威。
+const OFFICE_CAP = { word: false, excel: false, checked: false };
+
+// 常驻宿主脚本（无反引号、无 ${}，可安全放进 JS 模板字符串）。
+// 初始化 Word/Excel → 打印 READY<tab><word><tab><excel> → 循环读 stdin 任务行。
+// 任务行（制表符分隔，路径均为 ASCII 临时名）：  <id><tab><src><tab><dst><tab><kind>
+// 结果行：  <id><tab>OK   或   <id><tab>ERR<tab><msg>
+const HOST_PS = `
+$ErrorActionPreference='Stop'
+$word=$null; $excel=$null
+function GetWord { if(-not $word){ $word=New-Object -ComObject Word.Application; $word.Visible=$false; $word.DisplayAlerts=0 }; $word }
+function GetExcel { if(-not $excel){ $excel=New-Object -ComObject Excel.Application; $excel.Visible=$false; $excel.DisplayAlerts=$false; $excel.AskToUpdateLinks=$false; $excel.AlertBeforeOverwriting=$false }; $excel }
+$wok=$false; $eok=$false
+try { $w=GetWord; if($w.Version){$wok=$true} } catch { $word=$null }
+try { $e=GetExcel; if($e.Version){$eok=$true} } catch { $excel=$null }
+[Console]::Out.Write('READY' + [char]9 + $wok.ToString().ToLower() + [char]9 + $eok.ToString().ToLower() + [char]10); [Console]::Out.Flush()
+while($true){
+  $line=[Console]::In.ReadLine()
+  if($null -eq $line){ break }
+  if($line -eq ''){ continue }
+  $parts=$line -split [char]9
+  $id=$parts[0]; $src=$parts[1]; $dst=$parts[2]; $kind=$parts[3]
+  try {
+    if($kind -eq 'word'){
+      $app=GetWord
+      $doc=$app.Documents.Open($src,$false,$true)
+      # ExportAsFixedFormat(...,Item=0=wdExportDocumentContent) 仅导出正文，排除批注/修订等标记
+      try { $doc.ExportAsFixedFormat($dst,17,$false,0,0,'','',0) } finally { $doc.Close($false) }
+    } else {
+      $app=GetExcel
+      $wb=$app.Workbooks.Open($src,0)
+      try {
+        # 若任意表设了打印区域，仅导出这些表（隐藏其余表，Workbook.ExportAsFixedFormat 自动跳过隐藏表）；
+        # 一张都没设才整本导出（各表导已用区域）。打印区域是 per-sheet 的，整本导出不会自动裁剪未设区域的表。
+        $hasAnyPA=$false
+        foreach($ws in $wb.Worksheets){ if($ws.PageSetup.PrintArea -and $ws.PageSetup.PrintArea -ne ''){ $hasAnyPA=$true; break } }
+        if($hasAnyPA){
+          foreach($ws in $wb.Worksheets){
+            $paSet=($ws.PageSetup.PrintArea -and $ws.PageSetup.PrintArea -ne '')
+            if(-not $paSet){ $ws.Visible=0 }   # xlSheetHidden
+          }
+        }
+        # IgnorePrintAreas=0(False)：尊重各表已设打印区域
+        $wb.ExportAsFixedFormat(0,$dst,0,0,0)
+      } finally { $wb.Close($false) }
+    }
+    [Console]::Out.Write($id + [char]9 + 'OK' + [char]10); [Console]::Out.Flush()
+  } catch {
+    [Console]::Out.Write($id + [char]9 + 'ERR' + [char]9 + ((($_.Exception.Message -split [char]10)[0]).Replace([char]9,' ')) + [char]10); [Console]::Out.Flush()
+  }
+}
+if($word){ try{ $word.Quit() }catch{} }
+if($excel){ try{ $excel.Quit() }catch{} }
+`;
+
+// 旧方案兜底：每次新开 powershell 进程转换（宿主不可用时）。Word: SaveAs(17=wdFormatPDF)；
+// Excel: ExportAsFixedFormat(0=xlTypePDF)。临时目录 guid 命名，路径经环境变量传入，规避中文/空格编码。
+const CONVERT_PS = `
+$ErrorActionPreference='Stop'
+$src=$env:ST_SRC; $dst=$env:ST_DST; $kind=$env:ST_KIND
+$app = if($kind -eq 'word'){ New-Object -ComObject Word.Application } else { New-Object -ComObject Excel.Application }
+try {
+  if($kind -eq 'word'){
+    $app.Visible=$false
+    $app.DisplayAlerts=0
+    $doc=$app.Documents.Open($src,$false,$true)
+    # ExportAsFixedFormat(...,Item=0) 仅导出正文，排除批注/修订等标记
+    $doc.ExportAsFixedFormat($dst,17,$false,0,0,'','',0)
+    $doc.Close($false)
+  } else {
+    $app.Visible=$false
+    $app.DisplayAlerts=$false
+    $app.AskToUpdateLinks=$false
+    $app.AlertBeforeOverwriting=$false
+    $wb=$app.Workbooks.Open($src,0)
+    try {
+      # 若任意表设了打印区域，仅导出这些表（隐藏其余表，导出时自动跳过）；全没设才整本导出
+      $hasAnyPA=$false
+      foreach($ws in $wb.Worksheets){ if($ws.PageSetup.PrintArea -and $ws.PageSetup.PrintArea -ne ''){ $hasAnyPA=$true; break } }
+      if($hasAnyPA){
+        foreach($ws in $wb.Worksheets){
+          $paSet=($ws.PageSetup.PrintArea -and $ws.PageSetup.PrintArea -ne '')
+          if(-not $paSet){ $ws.Visible=0 }   # xlSheetHidden
+        }
+      }
+      # IgnorePrintAreas=0(False)：尊重各表已设打印区域
+      $wb.ExportAsFixedFormat(0,$dst,0,0,0)
+    } finally { if($wb){ try{ $wb.Close($false) }catch{} } }
+  }
+} finally { try { $app.Quit() } catch {} }
+`;
+
+let hostProc = null;
+let hostReady = false;
+const jobMap = new Map();
+let jobSeq = 0;
+let jobQueue = Promise.resolve();
+let hostStdoutBuf = '';
+let shuttingDown = false;
+
+function hostEncodeCmd() {
+  const b64 = Buffer.from(HOST_PS, 'utf16le').toString('base64');
+  return ['-NoProfile', '-STA', '-EncodedCommand', b64];
+}
+
+function spawnHost() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+    let proc;
+    try {
+      proc = spawn('powershell.exe', hostEncodeCmd(), { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (e) { return finish(false); }
+    hostProc = proc;
+    hostReady = false;
+    hostStdoutBuf = '';
+
+    const processLine = (line) => {
+      if (line.startsWith('READY')) {
+        const parts = line.split('\t');
+        OFFICE_CAP.word = parts[1] === 'true';
+        OFFICE_CAP.excel = parts[2] === 'true';
+        OFFICE_CAP.checked = true;
+        hostReady = true;
+        if (OFFICE_CAP.word || OFFICE_CAP.excel) finish(true);
+        else { try { proc.kill(); } catch (e) {} hostProc = null; finish(false); }
+        return;
+      }
+      const parts = line.split('\t');
+      if (parts.length < 2) return;
+      const id = parseInt(parts[0], 10);
+      const job = jobMap.get(id);
+      if (!job) return;
+      clearTimeout(job.timer);
+      jobMap.delete(id);
+      if (parts[1] === 'OK') job.resolve();
+      else job.reject(new Error(parts.slice(2).join('\t') || '转换失败'));
+    };
+
+    proc.stdout.on('data', (d) => {
+      hostStdoutBuf += d.toString('utf8');
+      let idx;
+      while ((idx = hostStdoutBuf.indexOf('\n')) >= 0) {
+        const line = hostStdoutBuf.slice(0, idx).replace(/\r$/, '');
+        hostStdoutBuf = hostStdoutBuf.slice(idx + 1);
+        processLine(line);
+      }
+    });
+    proc.stderr.on('data', () => {});
+    proc.on('error', () => finish(false));
+    proc.on('exit', () => {
+      hostProc = null;
+      hostReady = false;
+      for (const [, j] of jobMap) { clearTimeout(j.timer); j.reject(new Error('转换宿主已退出')); }
+      jobMap.clear();
+      finish(false);
+      if ((OFFICE_CAP.word || OFFICE_CAP.excel) && !shuttingDown) spawnHost();
+    });
+    setTimeout(() => finish(false), 15000);
+  });
+}
+
+function fallbackConvert(kind, src, dst) {
+  return new Promise((resolve, reject) => {
+    execFile('powershell.exe', ['-NoProfile', '-STA', '-Command', CONVERT_PS], {
+      env: Object.assign({}, process.env, { ST_SRC: src, ST_DST: dst, ST_KIND: kind }),
+      timeout: 180000, windowsHide: true,
+    }, (err) => {
+      if (err) return reject(err);
+      if (!fs.existsSync(dst)) return reject(new Error('转换未生成 PDF'));
+      resolve();
+    });
+  });
+}
+
+// ---------- Office 文档转 PDF（常驻宿主优先，失败回退每次新开进程） ----------
+function convertOffice(buf, kind, srcExt) {
+  const task = () => new Promise((resolve, reject) => {
+    let dir;
+    let src, dst;   // 提到 executor 作用域，供异步回调 finish 访问（try 块内 const 外部不可见）
+    const finish = (err) => {
+      if (err) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} return reject(err); }
+      try {
+        if (!fs.existsSync(dst)) throw new Error('转换未生成 PDF');
+        resolve(fs.readFileSync(dst));
+      } catch (e) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} reject(e); }
+      finally { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} }
+    };
+    try {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stamptool-'));
+      // 必须保留原始扩展名：老格式(.doc/.xls)内容存成 .docx/.xlsx 时，
+      // Word/Excel 会判定「文件格式与文件扩展名不匹配」而拒绝打开（因其按扩展名选解析器）。
+      src = path.join(dir, 'in' + (srcExt || (kind === 'word' ? '.docx' : '.xlsx')));
+      dst = path.join(dir, 'out.pdf');
+      fs.writeFileSync(src, buf);
+
+      // 无常驻宿主 → 直接回退兜底方案
+      if (!(hostProc && hostReady)) {
+        return fallbackConvert(kind, src, dst).then(() => finish(null), finish);
+      }
+      // 派发任务给常驻宿主（stdin 写一行，stdout 回一行）
+      const id = ++jobSeq;
+      const timer = setTimeout(() => {
+        jobMap.delete(id);
+        finish(new Error('Office 转换超时（>170s）'));
+      }, 170000);
+      jobMap.set(id, {
+        resolve: () => { clearTimeout(timer); finish(null); },
+        reject: (e) => { clearTimeout(timer); finish(e); },
+        timer,
+      });
+      try {
+        hostProc.stdin.write(id + '\t' + src + '\t' + dst + '\t' + kind + '\n');
+      } catch (e) {
+        clearTimeout(timer); jobMap.delete(id);
+        fallbackConvert(kind, src, dst).then(() => finish(null), finish);
+      }
+    } catch (e) {
+      if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} }
+      reject(e);
+    }
+  });
+  // 串行锁：COM 不可并发，同一时刻只允许一个转换
+  const run = jobQueue.then(task, task);
+  jobQueue = run.then(() => {}, () => {});
+  return run;
+}
+
+function startConverter() {
+  return spawnHost().then((ok) => {
+    if (!ok) { OFFICE_CAP.word = false; OFFICE_CAP.excel = false; OFFICE_CAP.checked = true; }
+    return OFFICE_CAP;
+  });
+}
+
+process.on('exit', () => {
+  shuttingDown = true;
+  try { if (hostProc) hostProc.kill(); } catch (e) {}
+});
+
 // ---------- 静态资源：dev 磁盘 / SEA 嵌入 ----------
 function readAssetBytes(rel) {
   if (IS_SEA) {
@@ -209,7 +455,7 @@ async function handleApi(req, res, url) {
 
   if (p === '/api/events') return serveEvents(req, res);
 
-  if (p === '/api/health') return sendJson(res, 200, { ok: true, data: { sea: IS_SEA } });
+  if (p === '/api/health') return sendJson(res, 200, { ok: true, data: { sea: IS_SEA, office: OFFICE_CAP.word || OFFICE_CAP.excel, word: OFFICE_CAP.word, excel: OFFICE_CAP.excel } });
 
   if (p === '/api/seals' && req.method === 'GET') {
     const cfg = loadConfig();
@@ -267,6 +513,27 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { ok: true, data: { dir: resolveStampDir(cfg) } });
   }
 
+  // ---------- Office 文档转 PDF（本地直调 MS Office COM） ----------
+  if (p === '/api/convert' && req.method === 'POST') {
+    const rawName = decodeURIComponent(req.headers['x-filename'] || '');
+    const ext = (rawName.split('.').pop() || '').toLowerCase();
+    const isWord = ext === 'doc' || ext === 'docx';
+    const isExcel = ext === 'xls' || ext === 'xlsx';
+    if (!isWord && !isExcel) return sendJson(res, 400, { ok: false, error: '仅支持 Word / Excel 文档（.doc / .docx / .xls / .xlsx）' });
+    if (isWord && !OFFICE_CAP.word) return sendJson(res, 400, { ok: false, error: '本地无 MS Word，不支持文档转 PDF 直出，仅支持 PDF 盖章' });
+    if (isExcel && !OFFICE_CAP.excel) return sendJson(res, 400, { ok: false, error: '本地无 MS Excel，不支持文档转 PDF 直出，仅支持 PDF 盖章' });
+    let buf;
+    try { buf = await readBody(req, 50); }
+    catch (e) { return sendJson(res, 413, { ok: false, error: '文件过大（>50MB）' }); }
+    if (!buf.length) return sendJson(res, 400, { ok: false, error: '空文件' });
+    try {
+      const pdf = await convertOffice(buf, isWord ? 'word' : 'excel', '.' + ext);
+      return sendBytes(res, 200, pdf, 'application/pdf');
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: 'Office 转换失败：' + (e && e.message ? e.message : '未知错误') });
+    }
+  }
+
   return sendJson(res, 404, { ok: false, error: '未找到接口' });
 }
 
@@ -306,16 +573,23 @@ loadConfig();          // 首次运行自动生成 StampTool.json
 ensureDefaultDir();    // 首次运行自动建默认印章目录
 
 const NO_OPEN = process.argv.includes('--no-open');
-findPort(8731, (port) => {
-  if (!port) { console.error('无法找到可用端口'); process.exit(1); }
-  server.listen(port, '127.0.0.1', () => {
-    const url = 'http://127.0.0.1:' + port + '/';
-    console.log('文件盖章 已启动: ' + url);
-    if (!NO_OPEN) {
-      const cmd = process.platform === 'win32'
-        ? 'cmd /c start "" "' + url + '"'
-        : (process.platform === 'darwin' ? 'open "' + url + '"' : 'xdg-open "' + url + '"');
-      exec(cmd, () => {});
-    }
+
+function startServer() {
+  const capTxt = (OFFICE_CAP.word ? 'Word' : '') + (OFFICE_CAP.excel ? (OFFICE_CAP.word ? '+Excel' : 'Excel') : (OFFICE_CAP.word || OFFICE_CAP.excel ? '' : '无'));
+  findPort(8731, (port) => {
+    if (!port) { console.error('无法找到可用端口'); process.exit(1); }
+    server.listen(port, '127.0.0.1', () => {
+      const url = 'http://127.0.0.1:' + port + '/';
+      console.log('文件盖章 已启动: ' + url + '  (Office: ' + capTxt + ')');
+      if (!NO_OPEN) {
+        const cmd = process.platform === 'win32'
+          ? 'cmd /c start "" "' + url + '"'
+          : (process.platform === 'darwin' ? 'open "' + url + '"' : 'xdg-open "' + url + '"');
+        exec(cmd, () => {});
+      }
+    });
   });
-});
+}
+
+// 先拉起常驻转换宿主并完成 Office 能力检测（COM 实探权威），再起服务，保证页面首屏即拿到正确能力。
+startConverter().then(startServer).catch(startServer);

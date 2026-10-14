@@ -15,7 +15,9 @@
         <button class="btn pri" id="btnPick" type="button">选择文件</button>
       </div>
       <input type="file" id="fileInput" accept=".pdf,.jpg,.jpeg,.png" style="display:none">
-      <p class="uphint">PDF 直接盖章；jpg / png 自动转为 PDF 页；首次使用请先在右侧设置印章目录</p>
+      <p class="uphint">PDF 直接盖章；jpg / png 自动转为 PDF 页；Word / Excel 可直出 PDF 后盖章（需本机安装 MS Office）；首次使用请先在右侧设置印章目录</p>
+      <p id="officeHint" style="display:none;color:#9aa7b5;font-size:12px;margin:6px 0 0">本地无 MS Office，不支持文档转 PDF 直出，仅支持 PDF 盖章</p>
+      <p id="convStatus" style="color:#b06a00;font-weight:600;min-height:18px;margin:6px 0 0"></p>
     </div>
 
     <div id="workspace" style="display:none">

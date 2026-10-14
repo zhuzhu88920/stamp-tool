@@ -60,14 +60,18 @@ execFileSync(NODE_EXE,
   [postjectCli, OUT_EXE, 'NODE_SEA_BLOB', SEA_BLOB, '--sentinel-fuse', SENTINEL_FUSE],
   { cwd: ROOT, stdio: 'inherit' });
 
-// 可选 UPX 压缩：build/tools/ 下存在 upx.exe 时自动执行（86.9MB → ~22.4MB）。
+// 可选 UPX 压缩：build/tools/upx-*/upx.exe（亦兼容 build/upx-*/upx.exe）存在时自动执行（86.9MB → ~22.4MB）。
 // 已验证 UPX 压缩后的 SEA exe 功能完好；注意部分杀软可能对 UPX 壳误报，加白即可。
 let upx = null;
-for (const dir of fs.readdirSync(BUILD_DIR, { withFileTypes: true })) {
-  if (dir.isDirectory() && dir.name.startsWith('upx-')) {
-    const cand = path.join(BUILD_DIR, dir.name, 'upx.exe');
-    if (fs.existsSync(cand)) { upx = cand; break; }
+for (const base of [BUILD_DIR, path.join(BUILD_DIR, 'tools')]) {
+  if (!fs.existsSync(base)) continue;
+  for (const dir of fs.readdirSync(base, { withFileTypes: true })) {
+    if (dir.isDirectory() && dir.name.startsWith('upx-')) {
+      const cand = path.join(base, dir.name, 'upx.exe');
+      if (fs.existsSync(cand)) { upx = cand; break; }
+    }
   }
+  if (upx) break;
 }
 if (upx) {
   console.log('[+UPX] 压缩 …');

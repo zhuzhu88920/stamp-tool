@@ -299,8 +299,10 @@ async function loadFile(file) {
       bytes = new Uint8Array(await file.arrayBuffer());
     } else if (["jpg", "jpeg", "png"].includes(ext)) {
       bytes = await imageToPdf(file, ext);
+    } else if (["doc", "docx", "xls", "xlsx"].includes(ext)) {
+      bytes = await officeToPdf(file, ext);
     } else {
-      throw new Error("本地版仅支持 PDF / JPG / PNG（Word、Excel 请先另存为 PDF）");
+      throw new Error("本地版仅支持 PDF / JPG / PNG / Word / Excel");
     }
     await loadPdf(bytes, file.name.replace(/\.[^.]+$/, ""));
   } catch (e) {
@@ -319,6 +321,43 @@ async function imageToPdf(file, ext) {
   const page = doc.addPage([A4W, A4H]);
   page.drawImage(img, { x: (A4W - w) / 2, y: (A4H - h) / 2, width: w, height: h });
   return new Uint8Array(await doc.save());
+}
+
+// ---------- Office 文档转 PDF（本地直调 MS Office；无 Office 时由服务端返回灰字文案） ----------
+async function officeToPdf(file, ext) {
+  if ($("convStatus")) $("convStatus").textContent = `正在将 ${file.name} 转为 PDF（约 2~5 秒）…`;
+  try {
+    const r = await fetch("/api/convert", {
+      method: "POST",
+      headers: { "X-Filename": encodeURIComponent(file.name), "Content-Type": "application/octet-stream" },
+      body: file,
+    });
+    if (!r.ok || !(r.headers.get("content-type") || "").toLowerCase().includes("pdf")) {
+      let msg = `转换失败（HTTP ${r.status}）`;
+      try { msg = (await r.json()).error || msg; } catch {}
+      throw new Error(msg);
+    }
+    return new Uint8Array(await r.arrayBuffer());
+  } finally {
+    if ($("convStatus")) $("convStatus").textContent = "";
+  }
+}
+
+// ---------- Office 能力适配（按本机是否装 Office 动态收紧 accept 与灰字提示） ----------
+async function applyOfficeCapability() {
+  let word = false, excel = false;
+  try {
+    const h = await api("/api/health");
+    word = !!(h && h.word);
+    excel = !!(h && h.excel);
+  } catch (e) {}
+  const hasOffice = word || excel;
+  if ($("officeHint")) $("officeHint").style.display = hasOffice ? "none" : "";
+  if ($("fileInput")) {
+    $("fileInput").setAttribute("accept", hasOffice
+      ? ".pdf,.jpg,.jpeg,.png,.doc,.docx,.xls,.xlsx"
+      : ".pdf,.jpg,.jpeg,.png");
+  }
 }
 
 async function loadPdf(bytes, name) {
@@ -424,3 +463,6 @@ loadDir();   // 本地版
 // 本地版心跳：与本地服务保持一条 SSE 长连接；全部页面关闭后服务 8s 自动退出（cmd 窗口随之关闭）。
 // 断线由浏览器自动重连，刷新页面不会误杀（服务端有 8s 宽限）。
 try { new EventSource("/api/events"); } catch (e) {}
+
+// 按本机是否装 Office 适配 accept 与灰字提示
+applyOfficeCapability();
